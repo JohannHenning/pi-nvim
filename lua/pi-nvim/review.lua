@@ -17,6 +17,13 @@ local M = {}
 -- The bundle is kept on disk after being applied so :PiReview can re-apply it
 -- to buffers opened later; :PiReviewClear removes it.
 
+--- Canonicall resolves symlinks to an absolute path, or nil when missing.
+--- Uses vim.uv.fs_realpath (luv's name for realpath) with a resolve() fallback.
+local realpath = vim.uv.fs_realpath or function(p)
+  local r = vim.fn.resolve(p)
+  return (r ~= "") and r or nil
+end
+
 --- @type table<number, { prev_config: table|nil }>
 local reviewed = {}
 
@@ -122,7 +129,7 @@ end
 --- @param minidiff table mini.diff module
 --- @return integer number of buffers switched
 function M.apply_to_buffers(path, before, minidiff)
-  local target = vim.uv.realpath(path)
+  local target = realpath(path)
   if not target then return 0 end
 
   local applied = 0
@@ -130,7 +137,7 @@ function M.apply_to_buffers(path, before, minidiff)
     if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == "" then
       local bname = vim.api.nvim_buf_get_name(buf)
       if bname ~= "" then
-        local bpath = vim.uv.realpath(bname)
+        local bpath = realpath(bname)
         if bpath == target then
           if M.apply_to_buffer(buf, before, minidiff) then
             applied = applied + 1
