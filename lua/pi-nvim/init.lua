@@ -73,6 +73,30 @@ function M.setup(opts)
   vim.api.nvim_create_user_command("PiSessions", function()
     M.list_sessions()
   end, { desc = "List running pi sessions" })
+
+  -- Pi review protocol: watch for review bundles written by the pi bridge
+  -- extension and surface the agent's edits via the local diff viewer
+  -- (mini.diff snapshot source) when the prompt came from Neovim.
+  require("pi-nvim.review").init(M)
+end
+
+--- Build a prompt message for the socket, prefixed with structured metadata
+--- (origin, file, dirty state) so the pi-side bridge extension can react to
+--- prompts requested from Neovim (review flow) vs typed in the pi terminal.
+--- The prefix is stripped by the bridge before the agent sees the prompt.
+--- @param message string
+--- @return string
+function M.build_prompt_message(message)
+  local rel = vim.fn.expand("%:.")
+  if rel == "" then
+    return message
+  end
+  local meta = vim.json.encode({
+    origin = "nvim",
+    file = rel,
+    dirty = vim.bo.modified,
+  })
+  return string.format("[pi-nvim-meta] %s\n%s", meta, message)
 end
 
 --- Resolve the socket path to use.
@@ -199,57 +223,27 @@ end
 --- Send a prompt string to pi.
 --- @param message string|nil  If nil, prompts the user for input
 function M.prompt(message)
-  if message then
-    -- Check for a running pi terminal buffer
-    local term_buf = nil
-    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-      if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == "terminal" then
-        local name = vim.api.nvim_buf_get_name(buf)
-        -- Match ":pi" or ":pi " at the end/middle of the term name
-        if name:lower():match(":pi$") or name:lower():match(":pi%s") then
-          term_buf = buf
-          break
-        end
-      end
-    end
-
-    if term_buf then
-      local id = vim.b[term_buf].terminal_job_id
-      if id then
-        -- Focus or open the terminal window
-        local win = vim.fn.bufwinid(term_buf)
-        if win ~= -1 then
-          vim.api.nvim_set_current_win(win)
-        else
-          vim.cmd("botright split")
-          vim.api.nvim_win_set_buf(0, term_buf)
-        end
-
-        -- Send via bracketed paste to handle newlines correctly, and append \r to submit
-        local payload = "\x1b[200~" .. message .. "\x1b[201~\r"
-        vim.api.nvim_chan_send(id, payload)
-        vim.cmd("startinsert")
-        
-        vim.notify("Sent to pi terminal buffer", vim.log.levels.INFO)
-        return
-      end
-    end
-
-    M.send_raw({ type = "prompt", message = message }, function(err, resp)
-      if err then return end
-      if resp and resp.ok then
-        vim.notify("Sent to pi", vim.log.levels.INFO)
-      else
-        vim.notify("pi error: " .. (resp and resp.error or "unknown"), vim.log.levels.ERROR)
-      end
-    end)
-  else
+  if not message then
     vim.ui.input({ prompt = "Pi prompt: " }, function(input)
       if input and input ~= "" then
         M.prompt(input)
       end
     end)
+    return
   end
+
+  -- Always send over the socket. Prompts are never injected into a pi
+  -- terminal buffer, so every prompt originating from Neovim is marked with
+  -- [pi-nvim-meta] and pi can distinguish it from prompts typed directly in
+  -- the pi terminal ("else just edit" behavior).
+  M.send_raw({ type = "prompt", message = M.build_prompt_message(message) }, function(err, resp)
+    if err then return end
+    if resp and resp.ok then
+      vim.notify("Sent to pi", vim.log.levels.INFO)
+    else
+      vim.notify("pi error: " .. (resp and resp.error or "unknown"), vim.log.levels.ERROR)
+    end
+  end)
 end
 
 --- Send the current file path with optional prompt.
