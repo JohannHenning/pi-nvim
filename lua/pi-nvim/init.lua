@@ -13,21 +13,44 @@ end
 --- @class pi_nvim.Config
 --- @field socket_path string|nil  Override socket path (default: auto-discover)
 --- @field set_default_keymaps boolean|nil  Whether to create the default <leader>p mappings (default: true)
---- @field diff_flash pi_nvim.DiffFlashConfig
+--- @field diff table|nil  Diff review configuration
 M.config = {
   socket_path = nil,
   set_default_keymaps = true,
-  diff_flash = {
+  diff = {
     enabled = true,
-    duration_ms = 3000,
+    keys = {
+      accept = "<Leader>da",
+      reject = "<Leader>dr",
+      edit_note = "<Leader>dn",
+      delete_note = "<Leader>dx",
+      list_notes = "<Leader>dN",
+      expand_context = "<Leader>de",
+      shrink_context = "<Leader>ds",
+    },
   },
 }
+
+--- @type table<number, { socket: string, client: uv_pipe_t, tabId: number, connected: boolean, registered: boolean }>
+M.tab_sockets = {}
+
+--- @type number|nil
+M.current_tab_id = nil
+
+--- @type table<string, fun(err: string|nil, resp: table|nil)>
+M.pending_requests = {}
+
+--- @type number
+M.request_id_counter = 0
 
 --- @param opts pi_nvim.Config|nil
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 
-  require("pi-nvim.diff_flash").setup(M.config.diff_flash)
+  -- Setup diff review if enabled
+  if M.config.diff and M.config.diff.enabled then
+    require("pi-nvim.diff")
+  end
 
   -- Auto-reload buffers when files are changed externally (e.g. by pi agent).
   -- Only polls when a pi session is reachable. Respects existing autoread setting.
@@ -36,8 +59,21 @@ function M.setup(opts)
   end
   local reload_timer = vim.uv.new_timer()
   reload_timer:start(0, 1000, vim.schedule_wrap(function()
-    if M.get_socket_path() then
-      pcall(vim.cmd, "silent! checktime")
+    if not M.get_any_socket_path() then return end
+    -- Per-buffer checktime, skipping modified buffers: a global `checktime`
+    -- prompts the W11 "load file?" dialog whenever a modified buffer's file
+    -- changed on disk (e.g. the agent already wrote it by the time the diff
+    -- review opens). Unknown buffers reload silently, modified ones are left
+    -- to their owner.
+    for _, buf in ipairs(vim.fn.getbufinfo({ buflisted = 1 })) do
+      if
+        buf.loaded
+        and not buf.changed
+        and buf.name ~= ""
+        and vim.fn.filereadable(buf.name) == 1
+      then
+        pcall(vim.cmd, "silent! checktime " .. vim.fn.fnameescape(buf.name))
+      end
     end
   end))
 
@@ -81,10 +117,285 @@ function M.setup(opts)
     M.list_sessions()
   end, { desc = "List running pi sessions" })
 
-  -- Pi review protocol: watch for review bundles written by the pi bridge
-  -- extension and surface the agent's edits via the local diff viewer
-  -- (mini.diff snapshot source) when the prompt came from Neovim.
-  require("pi-nvim.review").init(M)
+  -- Per-tab socket management
+  M.init_tab_socket_management()
+end
+
+--- Initialize per-tab socket connection management
+function M.init_tab_socket_management()
+  local aug = vim.api.nvim_create_augroup("PiNvimTabSockets", { clear = true })
+
+  -- On tab enter, ensure we have a socket connection for this tab
+  vim.api.nvim_create_autocmd("TabEnter", {
+    group = aug,
+    callback = function()
+      local tabId = vim.api.nvim_get_current_tabpage()
+      M.ensure_tab_socket(tabId)
+    end,
+  })
+
+  -- On tab close, clean up socket
+  vim.api.nvim_create_autocmd("TabClosed", {
+    group = aug,
+    callback = function(args)
+      local tabId = tonumber(args.match)
+      if tabId and tabId > 0 then
+        pcall(M.close_tab_socket, tabId)
+      end
+    end,
+  })
+
+  -- Initialize socket for current tab
+  local currentTab = vim.api.nvim_get_current_tabpage()
+  M.ensure_tab_socket(currentTab)
+end
+
+--- Ensure a socket connection exists for the given tab
+--- @param tabId number
+function M.ensure_tab_socket(tabId)
+  if M.tab_sockets[tabId] and M.tab_sockets[tabId].connected then
+    M.current_tab_id = tabId
+    -- Re-register tab in case pi session restarted
+    if M.tab_sockets[tabId].client and not M.tab_sockets[tabId].registered then
+      M.register_tab(tabId)
+    end
+    return
+  end
+
+  -- Find socket for the current cwd (shared across tabs)
+  local sock_path = M.get_shared_socket_path()
+  if not sock_path then
+    -- No pi session in this cwd tree yet
+    M.tab_sockets[tabId] = { socket = nil, client = nil, tabId = tabId, connected = false, registered = false }
+    M.current_tab_id = tabId
+    vim.notify(
+      string.format("No pi session in this directory tree. Start pi here or use :PiSessions to pick one."),
+      vim.log.levels.INFO
+    )
+    return
+  end
+
+  M.connect_to_socket(tabId, sock_path)
+  M.current_tab_id = tabId
+end
+
+--- Get the shared socket path for the current cwd (used by all tabs)
+--- @return string|nil
+function M.get_shared_socket_path()
+  if M.config.socket_path then
+    return M.config.socket_path
+  end
+
+  local sd = sockets_dir()
+  if not sd then return nil end
+  local cwd = vim.uv.cwd()
+
+  local ok, files = pcall(vim.fn.glob, sd .. "/*.info", false, true)
+  if ok and files then
+    local sep = package.config:sub(1, 1)
+    local best_sock, best_mtime = nil, 0
+    for _, info_path in ipairs(files) do
+      local content_ok, content = pcall(vim.fn.readfile, info_path)
+      if content_ok and content and content[1] then
+        local parsed_ok, info = pcall(vim.json.decode, content[1])
+        if parsed_ok and info then
+          local sock_file = info_path:sub(1, -6)
+          local stat = vim.uv.fs_stat(sock_file)
+          local addr = info.socket or sock_file
+          if stat then
+            -- Only match pi sessions in this cwd or an ancestor (pi in repo root,
+            -- Neovim opened in a subdir). Unrelated dirs require a manual pick
+            -- via :PiSessions — auto-discovery must not bridge into them.
+            local scwd = info.cwd or ""
+            local in_cwd_tree = cwd == scwd
+              or (scwd ~= "" and cwd:sub(1, #scwd + 1) == scwd .. sep)
+            if in_cwd_tree and stat.mtime.sec > best_mtime then
+              best_mtime = stat.mtime.sec
+              best_sock = addr
+            end
+          end
+        end
+      end
+    end
+    if best_sock then return best_sock end
+  end
+
+  -- No cwd-matching pi session found. Caller will mark the tab as unconnected;
+  -- the user can pick a session deliberately with :PiSessions.
+  return nil
+end
+
+--- Connect to the shared socket for a specific tab
+--- @param tabId number
+--- @param sock_path string
+function M.connect_to_socket(tabId, sock_path)
+  local client = vim.uv.new_pipe(false)
+  if not client then
+    vim.notify("Failed to create pipe for tab " .. tabId, vim.log.levels.ERROR)
+    return
+  end
+
+  client:connect(sock_path, function(err)
+    if err then
+      vim.schedule(function()
+        vim.notify("Failed to connect to pi for tab " .. tabId .. ": " .. err, vim.log.levels.ERROR)
+        M.tab_sockets[tabId] = { socket = sock_path, client = nil, tabId = tabId, connected = false, registered = false }
+      end)
+      return
+    end
+
+    -- Register this tab with the pi session
+    M.tab_sockets[tabId] = { socket = sock_path, client = client, tabId = tabId, connected = true, registered = false }
+    M.register_tab(tabId)
+
+    local buf = ""
+    client:read_start(function(read_err, data)
+      if read_err then
+        client:close()
+        vim.schedule(function()
+          M.handle_disconnect(tabId, read_err)
+        end)
+        return
+      end
+      if data then
+        buf = buf .. data
+        local nl = buf:find("\n")
+        while nl do
+          local line = buf:sub(1, nl - 1)
+          buf = buf:sub(nl + 1)
+          -- Socket callbacks run in a fast event context where most nvim API
+          -- calls (nvim_set_hl, nvim_open_win, ...) are forbidden. Defer to the
+          -- main loop; vim.schedule preserves ordering.
+          vim.schedule(function()
+            M.handle_socket_message(tabId, line)
+          end)
+          nl = buf:find("\n")
+        end
+      else
+        -- EOF
+        client:close()
+        vim.schedule(function()
+          M.handle_disconnect(tabId, "EOF")
+        end)
+      end
+    end)
+  end)
+end
+
+--- Register this tab with the pi session
+--- @param tabId number
+function M.register_tab(tabId)
+  local sock = M.tab_sockets[tabId]
+  if not sock or not sock.connected or not sock.client then
+    return
+  end
+
+  local cwd = vim.uv.cwd()
+  local nvimPid = vim.fn.getpid()
+  local payload = vim.json.encode({ type = "register_tab", tabId = tabId, cwd = cwd, nvimPid = nvimPid }) .. "\n"
+  sock.client:write(payload)
+  sock.registered = true
+end
+
+--- Handle incoming message from pi socket
+--- @param tabId number
+--- @param line string
+function M.handle_socket_message(tabId, line)
+  local ok, msg = pcall(vim.json.decode, line)
+  if not ok or not msg then return end
+
+  -- Check if this is a response to a pending request
+  if msg.request_id and M.pending_requests[msg.request_id] then
+    local cb = M.pending_requests[msg.request_id]
+    M.pending_requests[msg.request_id] = nil
+    cb(nil, msg)
+    return
+  end
+
+  if msg.type == "diff_review" then
+    -- Handle diff review request from pi
+    local diff = require("pi-nvim.diff")
+    diff.handle_diff_review(msg, M)
+  elseif msg.type == "pong" then
+    -- Ping response (handled via request_id above)
+  end
+end
+
+--- Handle socket disconnect
+--- @param tabId number
+--- @param err string
+function M.handle_disconnect(tabId, err)
+  local sock = M.tab_sockets[tabId]
+  if sock and sock.client then
+    sock.client:close()
+  end
+  M.tab_sockets[tabId] = { socket = sock and sock.socket or nil, client = nil, tabId = tabId, connected = false, registered = false }
+  vim.notify("Pi disconnected from tab " .. tabId .. ": " .. err, vim.log.levels.WARN)
+end
+
+--- Close socket for a tab
+--- @param tabId number
+function M.close_tab_socket(tabId)
+  local sock = M.tab_sockets[tabId]
+  if not sock then return end
+  if sock.client then
+    local ok, err = pcall(function() sock.client:close() end)
+    if not ok then
+      vim.notify("Error closing pi socket: " .. err, vim.log.levels.WARN)
+    end
+  end
+  M.tab_sockets[tabId] = nil
+end
+
+--- Get the socket path for the current tab (uses shared socket)
+--- @return string|nil
+function M.get_socket_path()
+  local tabId = M.current_tab_id or vim.api.nvim_get_current_tabpage()
+  local sock = M.tab_sockets[tabId]
+  if sock and sock.connected then
+    return sock.socket
+  end
+  -- Fallback to shared socket discovery
+  return M.get_shared_socket_path()
+end
+
+--- Get any available socket path (fallback for backwards compatibility)
+--- @return string|nil
+function M.get_any_socket_path()
+  return M.get_shared_socket_path()
+end
+
+--- Send a raw JSON message to the pi socket for the current tab
+--- @param msg table
+--- @param cb fun(err: string|nil, response: table|nil)|nil
+function M.send_raw(msg, cb)
+  local tabId = M.current_tab_id or vim.api.nvim_get_current_tabpage()
+  local sock = M.tab_sockets[tabId]
+
+  if not sock or not sock.connected or not sock.client then
+    -- Try to connect
+    M.ensure_tab_socket(tabId)
+    sock = M.tab_sockets[tabId]
+    if not sock or not sock.connected or not sock.client then
+      local err = "No pi session found for tab " .. tabId .. ". Is pi running with pi-nvim extension?"
+      vim.notify(err, vim.log.levels.ERROR)
+      if cb then cb(err, nil) end
+      return
+    end
+  end
+
+  -- When a callback is wanted, attach a request_id so the response can be
+  -- correlated — and write the message EXACTLY ONCE. Sending it twice (once
+  -- plain, once with request_id) dispatches every prompt/ping twice to the pi
+  -- side, and two concurrent dispatches can race into agent.prompt()'s
+  -- "already processing" guard, dropping one prompt into a <runtime> error.
+  local out_msg = msg
+  if cb then
+    M.request_id_counter = M.request_id_counter + 1
+    out_msg = vim.tbl_extend("force", msg, { request_id = tostring(M.request_id_counter) })
+    M.pending_requests[out_msg.request_id] = cb
+  end
+  sock.client:write(vim.json.encode(out_msg) .. "\n")
 end
 
 --- Build a prompt message for the socket, prefixed with structured metadata
@@ -102,129 +413,9 @@ function M.build_prompt_message(message)
     origin = "nvim",
     file = rel,
     dirty = vim.bo.modified,
+    tabId = M.current_tab_id or vim.api.nvim_get_current_tabpage(),
   })
   return string.format("[pi-nvim-meta] %s\n%s", meta, message)
-end
-
---- Resolve the socket path to use.
---- Priority: config override > cwd-based > latest symlink
---- @return string|nil
-function M.get_socket_path()
-  if M.config.socket_path then
-    return M.config.socket_path
-  end
-
-  local sd = sockets_dir()
-  if not sd then return nil end
-  local cwd = vim.uv.cwd()
-
-  -- Scan the sockets directory for .info files
-  local ok, files = pcall(vim.fn.glob, sd .. "/*.info", false, true)
-  if ok and files then
-    -- Collect live sessions. The .sock file is a real unix socket on unix and
-    -- a liveness marker on Windows; the connect address always comes from the
-    -- manifest's "socket" field (falls back to the file-derived path).
-    local best_sock, best_mtime = nil, 0
-    local any_sock, any_mtime = nil, 0
-    for _, info_path in ipairs(files) do
-      local content_ok, content = pcall(vim.fn.readfile, info_path)
-      if content_ok and content and content[1] then
-        local parsed_ok, info = pcall(vim.json.decode, content[1])
-        if parsed_ok and info then
-          local sock_file = info_path:sub(1, -6) -- strip ".info"
-          local stat = vim.uv.fs_stat(sock_file)
-          local addr = info.socket or sock_file
-          if stat then
-            if stat.mtime.sec > any_mtime then
-              any_mtime = stat.mtime.sec
-              any_sock = addr
-            end
-            if info.cwd == cwd and stat.mtime.sec > best_mtime then
-              best_mtime = stat.mtime.sec
-              best_sock = addr
-            end
-          end
-        end
-      end
-    end
-    if best_sock then return best_sock end
-    if any_sock then return any_sock end
-  end
-
-  -- Fall back to latest symlink (unix only; Windows has none)
-  if vim.fn.has("win32") == 0 then
-    local latest = "/tmp/pi-nvim-latest.sock"
-    if vim.uv.fs_stat(latest) then
-      return latest
-    end
-  end
-
-  return nil
-end
-
---- Send a raw JSON message to the pi socket and call cb with the parsed response.
---- @param msg table
---- @param cb fun(err: string|nil, response: table|nil)|nil
-function M.send_raw(msg, cb)
-  local sock_path = M.get_socket_path()
-  if not sock_path then
-    local err = "No pi session found. Is pi running with pi-nvim extension?"
-    vim.notify(err, vim.log.levels.ERROR)
-    if cb then cb(err, nil) end
-    return
-  end
-
-  local client = vim.uv.new_pipe(false)
-  if not client then
-    local err = "Failed to create pipe"
-    vim.notify(err, vim.log.levels.ERROR)
-    if cb then cb(err, nil) end
-    return
-  end
-
-  client:connect(sock_path, function(err)
-    if err then
-      vim.schedule(function()
-        vim.notify("Failed to connect to pi: " .. err, vim.log.levels.ERROR)
-        if cb then cb(err, nil) end
-      end)
-      return
-    end
-
-    local payload = vim.json.encode(msg) .. "\n"
-    client:write(payload)
-
-    local buf = ""
-    client:read_start(function(read_err, data)
-      if read_err then
-        client:close()
-        vim.schedule(function()
-          if cb then cb(read_err, nil) end
-        end)
-        return
-      end
-      if data then
-        buf = buf .. data
-        local nl = buf:find("\n")
-        if nl then
-          local line = buf:sub(1, nl - 1)
-          client:read_stop()
-          client:close()
-          vim.schedule(function()
-            local ok, resp = pcall(vim.json.decode, line)
-            if ok and resp then
-              if cb then cb(nil, resp) end
-            else
-              if cb then cb("Invalid response from pi", nil) end
-            end
-          end)
-        end
-      else
-        -- EOF
-        client:close()
-      end
-    end)
-  end)
 end
 
 --- Send a prompt string to pi.
@@ -239,10 +430,6 @@ function M.prompt(message)
     return
   end
 
-  -- Always send over the socket. Prompts are never injected into a pi
-  -- terminal buffer, so every prompt originating from Neovim is marked with
-  -- [pi-nvim-meta] and pi can distinguish it from prompts typed directly in
-  -- the pi terminal ("else just edit" behavior).
   M.send_raw({ type = "prompt", message = M.build_prompt_message(message) }, function(err, resp)
     if err then return end
     if resp and resp.ok then
@@ -276,7 +463,6 @@ end
 
 --- Send the visual selection with a prompt.
 function M.send_selection()
-  -- Get the visual selection
   local start_pos = vim.fn.getpos("'<")
   local end_pos = vim.fn.getpos("'>")
   local lines = vim.fn.getregion(start_pos, end_pos, { type = vim.fn.visualmode() })
@@ -339,7 +525,7 @@ function M.ping()
   end)
 end
 
---- List all running pi sessions.
+--- List all running pi sessions (per tab).
 function M.list_sessions()
   local sd = sockets_dir()
   if not sd then
@@ -361,11 +547,9 @@ function M.list_sessions()
         local sock_file = info_path:sub(1, -6)
         local alive = vim.uv.fs_stat(sock_file) ~= nil
         if alive then
-          -- Format start time as relative or short time
           local started = ""
           if info.startedAt then
             local ok2, ts = pcall(function()
-              -- Parse ISO 8601: "2026-03-01T14:10:09.123Z"
               local y, mo, d, h, mi, s = info.startedAt:match("(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
               if h and mi then
                 return string.format("%s:%s", h, mi)
@@ -377,6 +561,7 @@ function M.list_sessions()
           table.insert(sessions, {
             cwd = info.cwd or "?",
             pid = info.pid or "?",
+            tabId = info.tabId or "?",
             started = started,
             socket = info.socket or sock_file,
           })
@@ -385,25 +570,71 @@ function M.list_sessions()
     end
   end
 
-  if #sessions == 0 then
+  -- Collect unique pi sessions by cwd (from manifests)
+  local session_map = {}
+  for _, info_path in ipairs(files) do
+    local content_ok, content = pcall(vim.fn.readfile, info_path)
+    if content_ok and content and content[1] then
+      local parsed_ok, info = pcall(vim.json.decode, content[1])
+      if parsed_ok and info then
+        local sock_file = info_path:sub(1, -6)
+        local alive = vim.uv.fs_stat(sock_file) ~= nil
+        if alive then
+          local started = ""
+          if info.startedAt then
+            local ok2, ts = pcall(function()
+              local y, mo, d, h, mi, s = info.startedAt:match("(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+              if h and mi then
+                return string.format("%s:%s", h, mi)
+              end
+              return info.startedAt
+            end)
+            if ok2 then started = ts end
+          end
+          local cwd = info.cwd or "?"
+          if not session_map[cwd] then
+            session_map[cwd] = {
+              cwd = cwd,
+              pid = info.pid or "?",
+              started = started,
+              socket = info.socket or sock_file,
+            }
+          end
+        end
+      end
+    end
+  end
+
+  if vim.tbl_isempty(session_map) then
     vim.notify("No pi sessions found", vim.log.levels.INFO)
     return
   end
 
+  -- Build items: one per pi session (cwd), showing registered tabs
   local items = {}
-  local current = M.get_socket_path()
-  for _, s in ipairs(sessions) do
-    local marker = (current == s.socket) and "●" or "○"
-    local time_str = s.started ~= "" and string.format(" started %s", s.started) or ""
-    table.insert(items, string.format("%s %s [pid %s%s]", marker, s.cwd, s.pid, time_str))
+  for cwd, session in pairs(session_map) do
+    -- Find registered tabs for this cwd
+    local registered_tabs = {}
+    for tabId, sock in pairs(M.tab_sockets) do
+      if sock.connected and sock.registered and sock.socket == session.socket then
+        table.insert(registered_tabs, tabId)
+      end
+    end
+
+    local time_str = session.started ~= "" and string.format(" started %s", session.started) or ""
+    local tab_str = #registered_tabs > 0 and table.concat(registered_tabs, ",") or "none"
+
+    table.insert(items, string.format("%s [pid %s%s] tabs: %s", cwd, session.pid, time_str, tab_str))
   end
 
-  vim.ui.select(items, { prompt = "Pi sessions:" }, function(choice, idx)
+  vim.ui.select(items, { prompt = "Pi sessions (per cwd):" }, function(choice, idx)
     if not choice or not idx then return end
-    local session = sessions[idx]
+    local cwd_list = {}
+    for cwd, _ in pairs(session_map) do table.insert(cwd_list, cwd) end
+    local session = session_map[cwd_list[idx]]
     if session then
       M.config.socket_path = session.socket
-      vim.notify(string.format("Connected to pi at %s [pid %s]", session.cwd, session.pid), vim.log.levels.INFO)
+      vim.notify(string.format("Switched to pi session at %s [pid %s]", session.cwd, session.pid), vim.log.levels.INFO)
     end
   end)
 end
