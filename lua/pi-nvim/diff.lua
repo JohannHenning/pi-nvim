@@ -7,7 +7,7 @@ local M = {}
 --- @class pi_nvim.DiffReviewNote
 --- @field buf integer
 --- @field mark_ids integer[]
---- @field side "current"|"proposed"
+--- @field side "original"|"proposed"
 --- @field start_row integer 0-indexed inclusive
 --- @field end_row integer 0-indexed inclusive
 --- @field note string
@@ -122,136 +122,6 @@ local function setup_highlights()
 end
 
 --- Read file content from disk
---- @param path string
---- @return string[]
-local function read_file(path)
-  local f = io.open(path, "r")
-  if not f then
-    return {}
-  end
-  local content = f:read("*a")
-  f:close()
-  return vim.split(content, "\n", { plain = true })
-end
-
---- Write file content to disk
---- @param path string
---- @param lines string[]
---- @return boolean
-local function write_file(path, lines)
-  local dir = vim.fn.fnamemodify(path, ":h")
-  vim.fn.mkdir(dir, "p")
-  local f = io.open(path, "w")
-  if not f then
-    vim.notify("Failed to write: " .. path, vim.log.levels.ERROR)
-    return false
-  end
-  f:write(table.concat(lines, "\n"))
-  f:close()
-  return true
-end
-
---- Get buffer content for a file, preferring loaded buffer (with unsaved changes)
---- @param path string
---- @return string[], integer|nil
-local function get_buffer_content(path)
-  local absPath = vim.fn.fnamemodify(path, ":p")
-  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) and vim.bo[buf].buftype == "" then
-      if vim.api.nvim_buf_get_name(buf) == absPath then
-        local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-        if vim.bo[buf].eol then
-          table.insert(lines, "")
-        end
-        return lines, buf
-      end
-    end
-  end
-  return read_file(absPath), nil
-end
-
---- Apply edits to content
---- @param content string[]
---- @param edits table[]
---- @return string[]?
-local function apply_edits(content, edits)
-  local text = table.concat(content, "\n")
-  local replacements = {}
-
-  for _, edit in ipairs(edits) do
-    local old_str = edit.oldText or ""
-    local new_str = edit.newText or ""
-
-    if old_str == "" then
-      vim.notify("diff: Empty oldText is not supported", vim.log.levels.ERROR)
-      return nil
-    end
-
-    local search_from = 1
-    local start_pos, end_pos = nil, nil
-
-    while true do
-      local s, e = text:find(old_str, search_from, true)
-      if not s then
-        break
-      end
-
-      local overlaps = false
-      for _, existing in ipairs(replacements) do
-        if not (e < existing.start_pos or s > existing.end_pos) then
-          overlaps = true
-          break
-        end
-      end
-
-      if not overlaps then
-        start_pos, end_pos = s, e
-        break
-      end
-
-      search_from = s + 1
-    end
-
-    if not start_pos then
-      vim.notify("diff: The original content not found in file", vim.log.levels.ERROR)
-      return nil
-    end
-
-    replacements[#replacements + 1] = {
-      start_pos = start_pos,
-      end_pos = end_pos,
-      new_str = new_str,
-    }
-  end
-
-  table.sort(replacements, function(a, b)
-    return a.start_pos < b.start_pos
-  end)
-
-  for i = 2, #replacements do
-    local prev = replacements[i - 1]
-    local curr = replacements[i]
-    if curr.start_pos <= prev.end_pos then
-      vim.notify("diff: Overlapping edits are not supported", vim.log.levels.ERROR)
-      return nil
-    end
-  end
-
-  local parts = {}
-  local last_pos = 1
-
-  for _, replacement in ipairs(replacements) do
-    parts[#parts + 1] = text:sub(last_pos, replacement.start_pos - 1)
-    parts[#parts + 1] = replacement.new_str
-    last_pos = replacement.end_pos + 1
-  end
-
-  parts[#parts + 1] = text:sub(last_pos)
-
-  local result = table.concat(parts)
-  return vim.split(result, "\n", { plain = true })
-end
-
 --- Refresh diff windows
 --- @param left_win integer
 --- @param right_win integer
@@ -300,27 +170,13 @@ function M.open_review(payload, send_response)
   local path = payload.path
   local proposed = payload.proposed
   local original = payload.original
-  local tool = payload.tool
-  local edits = payload.edits
   local reviewId = payload.id
 
-  -- Get current buffer content (with unsaved changes)
-  local before_lines, before_buf = get_buffer_content(path)
-  local proposed_lines
-
-  if tool == "edit" and edits and #edits > 0 then
-    proposed_lines = apply_edits(before_lines, edits)
-    if not proposed_lines then
-      send_response("reject")
-      return
-    end
-  elseif tool == "write" then
-    proposed_lines = vim.split(proposed, "\n", { plain = true })
-  else
-    vim.notify("diff: unexpected tool: " .. tostring(tool), vim.log.levels.ERROR)
-    send_response("reject")
-    return
-  end
+  -- Both sides come from the extension payload (disk state at tool-call time).
+  -- NOT from the live nvim buffer: the edit tool has already run by the time
+  -- the review opens, so a live buffer would already contain the edit and the
+  -- diff would be empty ("reversed"/no-op).
+  local proposed_lines = vim.split(proposed, "\n", { plain = true })
 
   -- Handle trailing newline
   local proposed_eol = #proposed_lines > 0 and proposed_lines[#proposed_lines] == ""
@@ -342,19 +198,45 @@ function M.open_review(payload, send_response)
   vim.cmd("tabnew")
   local review_tab = vim.api.nvim_get_current_tabpage()
 
-  -- Left: open the real original file (or create buffer with current content)
+  -- Left: frozen snapshot of the original (pre-edit) content. A scratch buffer,
+  -- not the live file buffer — the user's buffer is left fully alone (no more
+  -- write-protecting it during review), and the diff cannot drift if the buffer
+  -- later reloads from disk.
   local left_win = vim.api.nvim_get_current_win()
-  if before_buf and vim.api.nvim_buf_is_valid(before_buf) then
-    vim.api.nvim_win_set_buf(left_win, before_buf)
-  else
-    vim.cmd("edit " .. vim.fn.fnameescape(path))
+  -- :tabnew created an empty no-name buffer in this window; once we swap in the
+  -- snapshot it lingers in the buffer list after the review. Capture and remove it.
+  local tabnew_buf = vim.api.nvim_win_get_buf(left_win)
+  local before_name = "pi-nvim://original" .. path
+  local stale_orig = vim.fn.bufnr(before_name)
+  if stale_orig ~= -1 then
+    vim.api.nvim_buf_delete(stale_orig, { force = true })
   end
-  local current_buf = vim.api.nvim_win_get_buf(left_win)
-  local ft = vim.bo[current_buf].filetype
-  local prev_modifiable = vim.bo[current_buf].modifiable
-  local prev_readonly = vim.bo[current_buf].readonly
+  local original_lines = vim.split(original, "\n", { plain = true })
+  local original_eol = #original_lines > 0 and original_lines[#original_lines] == ""
+  if original_eol then
+    table.remove(original_lines)
+  end
+  local current_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(current_buf, 0, -1, false, original_lines)
+  vim.bo[current_buf].eol = original_eol
+  vim.bo[current_buf].modified = false
+  vim.bo[current_buf].bufhidden = "wipe"
   vim.bo[current_buf].modifiable = false
   vim.bo[current_buf].readonly = true
+  vim.api.nvim_buf_set_name(current_buf, before_name)
+  local ft = vim.filetype.match({ filename = path }) or ""
+  vim.api.nvim_win_set_buf(left_win, current_buf)
+
+  -- Clean up the empty [No Name] buffer that :tabnew left behind
+  if tabnew_buf ~= current_buf and vim.api.nvim_buf_is_valid(tabnew_buf) then
+    local nm = vim.api.nvim_buf_get_name(tabnew_buf)
+    local lc = vim.api.nvim_buf_line_count(tabnew_buf)
+    local empty_text = lc == 0
+      or (lc == 1 and vim.api.nvim_buf_get_lines(tabnew_buf, 0, 1, false)[1] == "")
+    if nm == "" and empty_text then
+      pcall(vim.api.nvim_buf_delete, tabnew_buf, { force = true })
+    end
+  end
 
   -- Right: proposed changes (editable)
   local stale = vim.fn.bufnr(after_name)
@@ -365,9 +247,23 @@ function M.open_review(payload, send_response)
   vim.api.nvim_buf_set_lines(proposed_buf, 0, -1, false, proposed_lines)
   vim.bo[proposed_buf].eol = proposed_eol
   vim.bo[proposed_buf].buftype = "acwrite"
+  -- Filling via nvim_buf_set_lines marks the buffer modified; this is review
+  -- data, not user edits, so don't prompt to save it on exit (E676 on acwrite).
+  vim.bo[proposed_buf].modified = false
+  -- Wipe the buffer once the review tab closes; leaving it loaded (acwrite +
+  -- modified) makes :q/:qa prompt to save it and then fail with E676.
+  vim.bo[proposed_buf].bufhidden = "wipe"
   vim.api.nvim_buf_set_name(proposed_buf, after_name)
   vim.cmd("vsplit")
   local right_win = vim.api.nvim_get_current_win()
+  -- :vsplit puts the new window left or right depending on 'splitright';
+  -- pin the layout so ORIGINAL is always left and PROPOSED always right.
+  if
+    vim.api.nvim_win_call(right_win, function() return vim.fn.winnr() end) == 1
+  then
+    vim.api.nvim_set_current_win(right_win)
+    vim.cmd("wincmd L")
+  end
   vim.api.nvim_win_set_buf(right_win, proposed_buf)
   if ft ~= "" then
     vim.bo[proposed_buf].filetype = ft
@@ -518,7 +414,7 @@ function M.open_review(payload, send_response)
   local help_lhs = help_key
   local help_collides = lhs_collides(help_lhs)
 
-  vim.wo[left_win].winbar = "%#PiNvimDiffWinbar# %#PiNvimDiffWinbarCurrent#CURRENT: " .. rel_path .. "%#PiNvimDiffWinbar#"
+  vim.wo[left_win].winbar = "%#PiNvimDiffWinbar# %#PiNvimDiffWinbarCurrent#ORIGINAL: " .. rel_path .. "%#PiNvimDiffWinbar#"
   local proposed_winbar = "%#PiNvimDiffWinbar# %#PiNvimDiffWinbarProposed# PROPOSED: " .. rel_path
   proposed_winbar = proposed_winbar .. " %#PiNvimDiffWinbar# %#PiNvimDiffWinbarHint#["
   for i, action in ipairs(actions) do
@@ -605,9 +501,9 @@ function M.open_review(payload, send_response)
   local next_note_seq = 0
 
   ---@param note pi_nvim.DiffReviewNote
-  ---@return "current"|"proposed"?
+  ---@return "original"|"proposed"?
   local function note_side(note)
-    if note.buf == current_buf then return "current" end
+    if note.buf == current_buf then return "original" end
     if note.buf == proposed_buf then return "proposed" end
     return nil
   end
@@ -812,9 +708,17 @@ function M.open_review(payload, send_response)
       clear_note_marks(entry)
     end
 
-    -- Close the review tab
+    -- Close the review tab (nvim_tabpage_close was removed in 0.10+). The
+    -- proposed buffer is acwrite and may be modified (user edits for the
+    -- modify action) — closing a modified acwrite buffer without a write
+    -- raises E37 and aborts the response. Its content is already captured
+    -- by the caller, so clear the flag and close silently.
+    if vim.api.nvim_buf_is_valid(proposed_buf) then
+      vim.bo[proposed_buf].modified = false
+    end
     if vim.api.nvim_tabpage_is_valid(review_tab) then
-      vim.api.nvim_tabpage_close(review_tab, true)
+      vim.api.nvim_set_current_tabpage(review_tab)
+      vim.cmd.tabclose()
     end
 
     -- Restore previous tab
@@ -822,11 +726,17 @@ function M.open_review(payload, send_response)
       vim.api.nvim_set_current_tabpage(prev_tab)
     end
 
-    -- Clean up buffers
-    if vim.api.nvim_buf_is_valid(current_buf) then
-      vim.bo[current_buf].modifiable = prev_modifiable
-      vim.bo[current_buf].readonly = prev_readonly
-    end
+    -- Refresh the real file buffer when the outcome lands on disk, but only
+    -- if it is open AND unmodified — checktime on a modified buffer fires the
+    -- interactive "load file?" W11 prompt. Unsaved local edits stay untouched.
+    -- Reject reverts the file in the extension, so wait a moment for that.
+    local delay = action == "reject" and 300 or 0
+    vim.defer_fn(function()
+      local bufnr = vim.fn.bufnr(path)
+      if bufnr ~= -1 and vim.api.nvim_buf_is_loaded(bufnr) and not vim.bo[bufnr].modified then
+        pcall(vim.cmd, "checktime " .. vim.fn.fnameescape(path))
+      end
+    end, delay)
 
     send_response(action, content)
   end
@@ -868,7 +778,7 @@ function M.open_review(payload, send_response)
           local new_note = {
             buf = buf,
             mark_ids = {},
-            side = buf == current_buf and "current" or "proposed",
+            side = buf == current_buf and "original" or "proposed",
             start_row = start_row,
             end_row = end_row,
             note = input,

@@ -79,7 +79,14 @@ interface Session {
   connections: Map<net.Socket, TabConnection>;
   pendingReviews: Map<
     string,
-    { resolve: (action: string, content?: string) => void; timeout: NodeJS.Timeout; tabId: number }
+    {
+      resolve: (action: string, content?: string) => void;
+      timeout: NodeJS.Timeout;
+      tabId: number;
+      path?: string;
+      original?: string;
+      existedBefore?: boolean;
+    }
   >;
 }
 
@@ -89,6 +96,60 @@ let sessionStartCtx: ExtensionContext | null = null;
 export default function (pi: ExtensionAPI) {
   // Single session per pi process (per cwd)
   let session: Session | null = null;
+
+  // pi's host-side sendUserMessage is fire-and-forget: failures (incl.
+  // agent-busy guards) surface as a TUI "Extension <runtime>" notification
+  // instead of a rejection, so a retry loop can never observe them. As a
+  // safety net, stamp a cooldown when the previous run settles and wait it
+  // out before sending — on current pi versions the run is fully finished by
+  // agent_settled time, but the settle drain includes other extensions'
+  // async handlers and competing sends, so pacing still avoids the window
+  // where a fresh send could interleave with post-run cleanup.
+  let settlingUntil = 0;
+  pi.on("agent_settled", () => {
+    settlingUntil = Date.now() + 400;
+  });
+
+  // Send a prompt to the agent. Waits out the settle window so the call sees a
+  // truly idle agent; deliverAs:"followUp" queues while streaming otherwise.
+  //
+  // pi's sendUserMessage is fire-and-forget from an extension's perspective:
+  // the host wraps it in .catch() and swallows every rejection into a
+  // fire-and-forget TUI notification (Extension "<runtime>" error) instead of
+  // rejecting or returning a promise. Two dispatches issued while the agent is
+  // idle can therefore both take the direct prompt path concurrently — the
+  // session only sets its streaming flag inside _runAgentPrompt, after several
+  // awaits (input handlers, auth, compaction, before_agent_start) — and the
+  // second one hits agent-core's activeRun guard ("Agent is already processing
+  // a prompt"), losing the prompt and surfacing a spurious error notification.
+  // Serialize dispatches here: each send waits until the previous one was
+  // initiated plus a settle gap, so by the time the next prompt fires the first
+  // has either started a run (followUp path: safe) or completed its preflight.
+  let dispatchChain: Promise<void> = Promise.resolve();
+  let lastDispatchAt = 0;
+  const DISPATCH_GAP_MS = 1000;
+
+  async function ensurePromptDelivered(text: string): Promise<string | null> {
+    while (Date.now() < settlingUntil) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const slot = dispatchChain.then(async () => {
+      const wait = lastDispatchAt + DISPATCH_GAP_MS - Date.now();
+      if (wait > 0) {
+        await new Promise((r) => setTimeout(r, wait));
+      }
+      lastDispatchAt = Date.now();
+    });
+    dispatchChain = slot.catch(() => {});
+    await slot;
+    try {
+      await pi.sendUserMessage(text, { deliverAs: "followUp" });
+      return null;
+    } catch (e: any) {
+      // Defensive: real rejections (auth/model errors) surface here.
+      return String(e?.message ?? e);
+    }
+  }
 
   pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
     sessionStartCtx = ctx;
@@ -232,11 +293,12 @@ export default function (pi: ExtensionAPI) {
         if (filePath) {
           const absPath = path.isAbsolute(filePath) ? filePath : path.join(session.cwd, filePath);
 
-          // Read original content from disk
+          // Read original content from disk (pre-edit: the tool has not run yet)
           let originalContent = "";
           try {
             originalContent = fs.readFileSync(absPath, "utf-8");
           } catch {}
+          const fileExisted = fs.existsSync(absPath);
 
           // Compute proposed content
           let proposedContent = "";
@@ -270,7 +332,14 @@ export default function (pi: ExtensionAPI) {
               session!.pendingReviews.delete(reviewId);
               resolveFn!("accept");
             }, 60000);
-            session!.pendingReviews.set(reviewId, { resolve: resolveFn!, timeout, tabId });
+            session!.pendingReviews.set(reviewId, {
+              resolve: resolveFn!,
+              timeout,
+              tabId,
+              path: absPath,
+              original: originalContent,
+              existedBefore: fileExisted,
+            });
           });
 
           // Send the diff review to the specific tab's connection
@@ -327,11 +396,10 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function handleMessage(raw: string, conn: net.Socket) {
+  async function handleMessage(raw: string, conn: net.Socket) {
     let msg: any;
     try {
       msg = JSON.parse(raw);
-
       if (msg.type === "ping") {
         respond(conn, { ok: true, type: "pong" }, msg.request_id);
         return;
@@ -386,24 +454,10 @@ export default function (pi: ExtensionAPI) {
         }
 
         if (sessionStartCtx) {
-          try {
-            pi.sendUserMessage(promptMessage, { deliverAs: "followUp" });
-          } catch (e: any) {
-            // If agent is busy, try steer for mid-turn queuing
-            if (e.message?.includes("already processing")) {
-              try {
-                pi.sendUserMessage(promptMessage, { deliverAs: "steer" });
-              } catch {
-                respond(
-                  conn,
-                  { ok: false, error: "Agent is busy. Please wait for current turn to complete." },
-                  msg.request_id,
-                );
-                return;
-              }
-            } else {
-              throw e;
-            }
+          const deliveryError = await ensurePromptDelivered(promptMessage);
+          if (deliveryError) {
+            respond(conn, { ok: false, error: deliveryError }, msg.request_id);
+            return;
           }
         }
         respond(conn, { ok: true }, msg.request_id);
@@ -417,6 +471,22 @@ export default function (pi: ExtensionAPI) {
           session!.pendingReviews.delete(msg.id);
           const action =
             msg.action === "reject" ? "reject" : msg.action === "modify" ? "modify" : "accept";
+          // Apply the review outcome to the file. The edit tool has already run
+          // (non-blocking review): reject restores the pre-edit state, modify
+          // replaces the file with the user's edited content, accept is a no-op.
+          if (review.path) {
+            try {
+              if (action === "reject") {
+                if (review.existedBefore === false) {
+                  fs.unlinkSync(review.path);
+                } else {
+                  fs.writeFileSync(review.path, review.original ?? "", "utf-8");
+                }
+              } else if (action === "modify" && typeof msg.content === "string") {
+                fs.writeFileSync(review.path, msg.content, "utf-8");
+              }
+            } catch {}
+          }
           review.resolve(action, msg.content);
         }
         const globalPending = (globalThis as any).__pi_nvim_pending_reviews;

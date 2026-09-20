@@ -59,8 +59,21 @@ function M.setup(opts)
   end
   local reload_timer = vim.uv.new_timer()
   reload_timer:start(0, 1000, vim.schedule_wrap(function()
-    if M.get_any_socket_path() then
-      pcall(vim.cmd, "silent! checktime")
+    if not M.get_any_socket_path() then return end
+    -- Per-buffer checktime, skipping modified buffers: a global `checktime`
+    -- prompts the W11 "load file?" dialog whenever a modified buffer's file
+    -- changed on disk (e.g. the agent already wrote it by the time the diff
+    -- review opens). Unknown buffers reload silently, modified ones are left
+    -- to their owner.
+    for _, buf in ipairs(vim.fn.getbufinfo({ buflisted = 1 })) do
+      if
+        buf.loaded
+        and not buf.changed
+        and buf.name ~= ""
+        and vim.fn.filereadable(buf.name) == 1
+      then
+        pcall(vim.cmd, "silent! checktime " .. vim.fn.fnameescape(buf.name))
+      end
     end
   end))
 
@@ -250,7 +263,12 @@ function M.connect_to_socket(tabId, sock_path)
         while nl do
           local line = buf:sub(1, nl - 1)
           buf = buf:sub(nl + 1)
-          M.handle_socket_message(tabId, line)
+          -- Socket callbacks run in a fast event context where most nvim API
+          -- calls (nvim_set_hl, nvim_open_win, ...) are forbidden. Defer to the
+          -- main loop; vim.schedule preserves ordering.
+          vim.schedule(function()
+            M.handle_socket_message(tabId, line)
+          end)
           nl = buf:find("\n")
         end
       else
@@ -366,19 +384,18 @@ function M.send_raw(msg, cb)
     end
   end
 
-  local payload = vim.json.encode(msg) .. "\n"
-  sock.client:write(payload)
-
-  -- For requests that need a response (ping), store callback with request ID
+  -- When a callback is wanted, attach a request_id so the response can be
+  -- correlated — and write the message EXACTLY ONCE. Sending it twice (once
+  -- plain, once with request_id) dispatches every prompt/ping twice to the pi
+  -- side, and two concurrent dispatches can race into agent.prompt()'s
+  -- "already processing" guard, dropping one prompt into a <runtime> error.
+  local out_msg = msg
   if cb then
     M.request_id_counter = M.request_id_counter + 1
-    local request_id = tostring(M.request_id_counter)
-    -- Add request_id to message for correlation
-    local msg_with_id = vim.tbl_extend("force", msg, { request_id = request_id })
-    payload = vim.json.encode(msg_with_id) .. "\n"
-    sock.client:write(payload)
-    M.pending_requests[request_id] = cb
+    out_msg = vim.tbl_extend("force", msg, { request_id = tostring(M.request_id_counter) })
+    M.pending_requests[out_msg.request_id] = cb
   end
+  sock.client:write(vim.json.encode(out_msg) .. "\n")
 end
 
 --- Build a prompt message for the socket, prefixed with structured metadata
